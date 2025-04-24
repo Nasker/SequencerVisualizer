@@ -7,6 +7,8 @@ let currentSequenceIndex = -1;
 const fileInput = document.getElementById('fileInput');
 const loadFileBtn = document.getElementById('loadFileBtn');
 const saveFileBtn = document.getElementById('saveFileBtn');
+const saveAsBtn = document.getElementById('saveAsBtn');
+const saveFileInput = document.getElementById('saveFileInput');
 const scenesList = document.getElementById('scenesList');
 const sequencesContainer = document.getElementById('sequencesContainer');
 const currentSceneIndexSpan = document.getElementById('currentSceneIndex');
@@ -18,6 +20,8 @@ const notesGrid = document.getElementById('notesGrid');
 loadFileBtn.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', handleFileSelect);
 saveFileBtn.addEventListener('click', saveChanges);
+saveAsBtn.addEventListener('click', () => saveFileInput.click());
+saveFileInput.addEventListener('change', saveChangesAs);
 
 // Initialize the application
 function init() {
@@ -58,6 +62,7 @@ function handleFileSelect(event) {
 function loadSequencerData(data) {
     sequencerData = data;
     saveFileBtn.disabled = false;
+    saveAsBtn.disabled = false;
     
     // Render scenes list
     renderScenesList();
@@ -481,7 +486,7 @@ function clearSequenceEditor() {
 function saveChanges() {
     if (!sequencerData) return;
     
-    const jsonString = JSON.stringify(sequencerData, null, 2);
+    const jsonString = JSON.stringify(sequencerData);
     const blob = new Blob([jsonString], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     
@@ -491,6 +496,41 @@ function saveChanges() {
     a.click();
     
     URL.revokeObjectURL(url);
+}
+
+// Save changes to a specific file location (Save As)
+function saveChangesAs(event) {
+    if (!sequencerData) return;
+    
+    // Get the selected file from the file input
+    const fileHandle = event.target.files[0];
+    if (!fileHandle) return;
+    
+    // Create compact JSON string without whitespace
+    const jsonString = JSON.stringify(sequencerData);
+    
+    // Create a Blob with the JSON data
+    const blob = new Blob([jsonString], { type: 'application/json' });
+    
+    // Create a FileReader to read the selected file path
+    const reader = new FileReader();
+    
+    // When the file is loaded, we'll have access to its path
+    reader.onload = function() {
+        // Create a download link with the specific path
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = fileHandle.name; // Use the selected file name
+        a.click();
+        
+        URL.revokeObjectURL(a.href);
+        
+        // Reset the file input so the same file can be selected again
+        saveFileInput.value = '';
+    };
+    
+    // Start reading the file to get its path
+    reader.readAsDataURL(fileHandle);
 }
 
 // Initialize the application when the page loads
