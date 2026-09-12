@@ -7,61 +7,195 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <div class="app-container">
-        <header>
-            <h1>RTP Sequence Visualizer</h1>
+    <div class="app">
+        <header class="topbar">
+            <div class="brand">
+                <span class="logo">RTP</span>n
+                <h1>Sequence Visualizer</h1>
+            </div>
             <div class="file-controls">
-                <button id="loadFileBtn">Load JSON File</button>
-                <input type="file" id="fileInput" accept=".json" style="display: none;">
-                <button id="saveFileBtn" disabled>Save Changes</button>
+                <span id="fileName" class="file-name">no file loaded</span>
+                <button id="loadFileBtn" class="btn">Open&hellip;</button>
+                <input type="file" id="fileInput" accept=".rtpseq,.bin,.json" hidden>
+                <button id="saveFileBtn" class="btn primary" disabled>Save .rtpseq</button>
+                <button id="exportJsonBtn" class="btn" disabled>Export JSON</button>
             </div>
         </header>
-        
-        <div class="scene-selector">
-            <h2>Scenes</h2>
+
+        <nav class="scene-bar">
             <ul id="scenesList" class="scenes-list"></ul>
-        </div>
-        
-        <main>
-            <div class="content">
-                <div class="sequences-container">
-                    <h2>Sequences in Scene <span id="currentSceneIndex">-</span></h2>
-                    <div id="sequencesContainer" class="sequences-grid"></div>
-                </div>
-                
-                <div class="sequence-editor">
-                    <h2>Sequence Editor</h2>
-                    <div class="sequence-properties">
-                        <div class="property-group">
-                            <label for="sequenceType">Type:</label>
-                            <select id="sequenceType">
-                                <option value="0">DRUM</option>
-                                <option value="1">BASS SYNTH</option>
-                                <option value="2">MONO SYNTH</option>
-                                <option value="3">POLY SYNTH</option>
-                                <option value="4">CONTROL TRACK</option>
-                                <option value="5">HARMONY TRACK</option>
-                            </select>
-                        </div>
-                        <div class="property-group">
-                            <label for="sequenceChannel">MIDI Channel:</label>
-                            <input type="number" id="sequenceChannel" min="0" max="16">
-                        </div>
-                    </div>
-                    
-                    <div class="sequence-grid-container">
-                        <h3>Notes</h3>
-                        <div id="notesGrid" class="notes-grid"></div>
-                    </div>
-                </div>
+            <div class="bar-actions">
+                <button id="addSceneBtn" class="btn small" title="Add scene">+ Scene</button>
+                <button id="removeSceneBtn" class="btn small" title="Remove current scene">&minus; Scene</button>
             </div>
+        </nav>
+
+        <main class="content">
+            <section class="panel sequences-panel">
+                <div class="panel-head">
+                    <h2>Scene <span id="currentSceneIndex">&ndash;</span>
+                        <span id="currentSceneName" class="scene-name"></span></h2>
+                    <div class="bar-actions">
+                        <button id="addSeqBtn" class="btn small" title="Add sequence">+ Seq</button>
+                        <button id="removeSeqBtn" class="btn small" title="Remove selected sequence">&minus; Seq</button>
+                    </div>
+                </div>
+                <div id="sequencesContainer" class="sequences-grid"></div>
+            </section>
+
+            <section class="panel editor-panel">
+                <div class="editor-head">
+                    <h2><span id="editorTypeDot" class="type-dot"></span>
+                        <span id="editorTitle">Select a sequence</span></h2>
+                    <label class="enabled-toggle">
+                        <input type="checkbox" id="sequenceEnabled"> Enabled
+                    </label>
+                </div>
+
+                <div class="props">
+                    <div class="prop">
+                        <label for="sequenceName">Name</label>
+                        <input type="text" id="sequenceName" maxlength="24"
+                               placeholder="Seq name">
+                    </div>
+                    <div class="prop">
+                        <label for="sequenceType">Type</label>
+                        <select id="sequenceType">
+                            <option value="0">DRUM</option>
+                            <option value="1">BASS SYNTH</option>
+                            <option value="2">MONO SYNTH</option>
+                            <option value="3">POLY SYNTH</option>
+                            <option value="4">CONTROL TRACK</option>
+                            <option value="5">HARMONY TRACK</option>
+                        </select>
+                    </div>
+                    <div class="prop">
+                        <label for="sequenceChannel">MIDI Ch</label>
+                        <input type="number" id="sequenceChannel" min="0" max="16">
+                    </div>
+                    <div class="prop">
+                        <label for="sequencePort">Port</label>
+                        <select id="sequencePort">
+                            <option value="0">Default route</option>
+                            <option value="1">USB Device</option>
+                            <option value="2">USB Host (all)</option>
+                            <option value="3">DIN</option>
+                            <option value="4">All ports</option>
+                            <option value="5">USB Host 1</option>
+                            <option value="6">USB Host 2</option>
+                            <option value="7">USB Host 3</option>
+                            <option value="8">USB Host 4</option>
+                        </select>
+                    </div>
+                    <div class="prop">
+                        <label for="sequenceInput">Input</label>
+                        <input type="number" id="sequenceInput" min="0" max="8">
+                    </div>
+                    <div class="prop">
+                        <label for="sequenceDivider">Clock div</label>
+                        <select id="sequenceDivider">
+                            <option value="0">1/1</option>
+                            <option value="1">1/2</option>
+                            <option value="2">1/4</option>
+                            <option value="3">1/4T</option>
+                            <option value="4">1/8</option>
+                            <option value="5">1/8T</option>
+                            <option value="6">1/16</option>
+                            <option value="7">1/16T</option>
+                            <option value="8">1/32</option>
+                            <option value="9">1/32T</option>
+                            <option value="10">1/64</option>
+                        </select>
+                    </div>
+                    <div class="prop">
+                        <label for="sequenceLength">Pages</label>
+                        <input type="number" id="sequenceLength" min="1" max="16">
+                    </div>
+                    <div class="prop">
+                        <label for="sequenceColor">Color</label>
+                        <div class="color-field">
+                            <input type="range" id="sequenceColor" min="0" max="31">
+                            <span id="colorSwatch" class="color-swatch"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="grid-wrap">
+                    <div id="notesGrid" class="notes-grid"></div>
+                    <p class="grid-hint">click = select &middot; double-click = toggle &middot;
+                        wheel = velocity &middot; shift+wheel = length</p>
+                </div>
+
+                <div id="noteInspector" class="note-inspector" hidden>
+                    <h3>Step <span id="niStep">-</span></h3>
+                    <div class="ni-fields">
+                        <label class="ni-check">
+                            <input type="checkbox" id="niOn"> On
+                        </label>
+                        <div id="niStandardFields" class="ni-group">
+                            <div class="prop">
+                                <label for="niNote">Note <span id="niNoteName" class="note-name"></span></label>
+                                <input type="number" id="niNote" min="0" max="127">
+                            </div>
+                            <div class="prop">
+                                <label for="niRead">Read</label>
+                                <input type="number" id="niRead" min="0" max="127">
+                            </div>
+                            <div class="prop prop-wide">
+                                <label for="niVel">Velocity</label>
+                                <div class="vel-field">
+                                    <input type="range" id="niVelRange" min="0" max="127">
+                                    <input type="number" id="niVel" min="0" max="127">
+                                </div>
+                            </div>
+                            <label class="ni-check">
+                                <input type="checkbox" id="niLit"> Literal pitch
+                            </label>
+                        </div>
+                        <div id="niHarmonyFields" class="ni-group" hidden>
+                            <div class="prop">
+                                <label for="niRoot">Root</label>
+                                <select id="niRoot">
+                                    <option value="0">C</option><option value="1">C#</option>
+                                    <option value="2">D</option><option value="3">D#</option>
+                                    <option value="4">E</option><option value="5">F</option>
+                                    <option value="6">F#</option><option value="7">G</option>
+                                    <option value="8">G#</option><option value="9">A</option>
+                                    <option value="10">A#</option><option value="11">B</option>
+                                </select>
+                            </div>
+                            <div class="prop">
+                                <label for="niChord">Chord</label>
+                                <select id="niChord">
+                                    <option value="0">note</option><option value="1">maj</option>
+                                    <option value="2">min</option><option value="3">maj7</option>
+                                    <option value="4">min7</option><option value="5">7</option>
+                                    <option value="6">dim</option><option value="7">dim7</option>
+                                    <option value="8">m7b5</option><option value="9">aug</option>
+                                    <option value="10">maj9</option><option value="11">m9</option>
+                                    <option value="12">9</option><option value="13">sus4</option>
+                                    <option value="14">sus2</option><option value="15">6</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="prop">
+                            <label for="niLen">Length</label>
+                            <input type="number" id="niLen" min="1" max="15">
+                        </div>
+                    </div>
+                </div>
+            </section>
         </main>
-        
-        <footer>
-            <p>RTP Sequence Visualizer - Created for RTPBuit Project</p>
+
+        <footer class="statusbar">
+            <span id="statusBar">Drop a .rtpseq or .json file to begin</span>
         </footer>
     </div>
-    
+
+    <div id="dropOverlay" class="drop-overlay" hidden>
+        <div class="drop-box">Drop .rtpseq / .json to load</div>
+    </div>
+
     <script src="app.js"></script>
 </body>
 </html>

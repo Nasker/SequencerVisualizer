@@ -1,497 +1,874 @@
-// Main application state
-let sequencerData = null;
-let currentSceneIndex = -1;
+/* ============================================================================
+ * RTP Sequence Visualizer
+ * ----------------------------------------------------------------------------
+ * Loads/saves RTPBuit sequencer patterns in the native RTP0 binary format
+ * (.rtpseq) and can still import/export the legacy JSON representation.
+ *
+ * Binary layout (little-endian, matches BuitPersistenceManager.cpp):
+ *   Header (8): 'R','T','P','0', version, nScenes, SCENE_BLOCK_SIZE, selScene
+ *   Per scene:  nameLen(1), name bytes, selSeq(1, v>=2), nSeq(1)
+ *   Per seq:    type, midiCh, color, lengthPages, input, port,
+ *               nNotes_lo, nNotes_hi, enabled(v>=2), clockDivider(v>=3)
+ *   Per note:   low u32  = note|read<<8|vel<<16|len<<24|ttl<<28
+ *               high u32 = midiCh|destPort<<4|usbHostIdx<<8|state<<16|lit<<17
+ * ==========================================================================*/
+
+'use strict';
+
+// ── Constants (mirror firmware constants.h) ──────────────────────────────────
+const RTP_VERSION   = 3;
+const SEQ_BLOCK     = 16;   // steps per page
+const SCENE_BLOCK   = 16;   // sequences per scene
+const N_PAGES       = 16;
+const N_COLORS      = 32;
+
+const TYPE_NAMES = ['DRUM', 'BASS', 'MONO', 'POLY', 'CONTROL', 'HARMONY'];
+
+// port parameter value -> label (RTPEventNoteSequence::getPortAsMidiPort)
+const PORT_NAMES = [
+    'Default route', 'USB Device', 'USB Host (all)', 'DIN',
+    'All ports', 'USB Host 1', 'USB Host 2', 'USB Host 3', 'USB Host 4'
+];
+
+// clock divider index -> pulses per step / label (CLOCK_DIVIDER_PULSES[11])
+const CLOCK_DIVIDER_PULSES  = [96, 48, 24, 16, 12, 8, 6, 4, 3, 2, 1];
+const CLOCK_DIVIDER_LABELS  = ['1/1', '1/2', '1/4', '1/4T', '1/8', '1/8T',
+                               '1/16', '1/16T', '1/32', '1/32T', '1/64'];
+
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+
+// Chord type index -> name, matching RTPLibrary chordStep[N_CHORDS] table
+// (NOT the firmware CHORD_TYPE_NAMES, which is misaligned with the table).
+const CHORD_NAMES = ['note','maj','min','maj7','min7','7','dim','dim7',
+                     'm7b5','aug','maj9','m9','9','sus4','sus2','6'];
+
+const TYPE_HARMONY = 5;
+
+// ── State ────────────────────────────────────────────────────────────────────
+let sequencerData       = null;
+let currentSceneIndex   = -1;
 let currentSequenceIndex = -1;
+let selectedNoteIndex   = -1;
+let currentFileName     = '';
 
-// DOM Elements
-const fileInput = document.getElementById('fileInput');
-const loadFileBtn = document.getElementById('loadFileBtn');
-const saveFileBtn = document.getElementById('saveFileBtn');
-const scenesList = document.getElementById('scenesList');
-const sequencesContainer = document.getElementById('sequencesContainer');
-const currentSceneIndexSpan = document.getElementById('currentSceneIndex');
-const sequenceType = document.getElementById('sequenceType');
-const sequenceChannel = document.getElementById('sequenceChannel');
-const notesGrid = document.getElementById('notesGrid');
+// ── DOM refs ─────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const fileInput        = $('fileInput');
+const loadFileBtn      = $('loadFileBtn');
+const saveFileBtn      = $('saveFileBtn');
+const exportJsonBtn    = $('exportJsonBtn');
+const fileNameLabel    = $('fileName');
+const scenesList       = $('scenesList');
+const sequencesContainer = $('sequencesContainer');
+const currentSceneIndexSpan = $('currentSceneIndex');
+const currentSceneNameSpan  = $('currentSceneName');
+const notesGrid        = $('notesGrid');
+const noteInspector    = $('noteInspector');
+const dropOverlay      = $('dropOverlay');
+const statusBar        = $('statusBar');
 
-// Event Listeners
-loadFileBtn.addEventListener('click', () => fileInput.click());
-fileInput.addEventListener('change', handleFileSelect);
-saveFileBtn.addEventListener('click', saveChanges);
-
-// Initialize the application
-function init() {
-    // Check if scenes.json exists in the same directory
-    fetch('scenes.json')
-        .then(response => {
-            if (response.ok) {
-                return response.json();
-            }
-            throw new Error('No scenes.json file found');
-        })
-        .then(data => {
-            loadSequencerData(data);
-        })
-        .catch(error => {
-            console.error('Error loading scenes.json:', error);
-        });
+// ── Firmware color palette (ColorFunctions.cpp colorMapper) ──────────────────
+function colorForIndex(idx) {
+    const hue = ((idx % N_COLORS) / N_COLORS) * 360;
+    const c = 255;
+    const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+    let r = 0, g = 0, b = 0;
+    if      (hue < 60)  { r = c; g = x; }
+    else if (hue < 120) { r = x; g = c; }
+    else if (hue < 180) { g = c; b = x; }
+    else if (hue < 240) { g = x; b = c; }
+    else if (hue < 300) { r = x; b = c; }
+    else                { r = c; b = x; }
+    return `rgb(${r | 0},${g | 0},${b | 0})`;
 }
 
-// Handle file selection
-function handleFileSelect(event) {
-    const file = event.target.files[0];
+function noteName(n) {
+    if (n < 0 || n > 127) return String(n);
+    return NOTE_NAMES[n % 12] + (Math.floor(n / 12) - 1);
+}
+
+// ============================================================================
+// RTP0 binary codec
+// ============================================================================
+function parseRtpseq(buffer) {
+    const dv = new DataView(buffer);
+    if (buffer.byteLength < 8) throw new Error('File too small');
+    if (dv.getUint8(0) !== 0x52 || dv.getUint8(1) !== 0x54 ||
+        dv.getUint8(2) !== 0x50 || dv.getUint8(3) !== 0x30) {
+        throw new Error('Not an RTP0 pattern file');
+    }
+    let o = 4;
+    const u8  = () => dv.getUint8(o++);
+    const u16 = () => { const v = dv.getUint16(o, true); o += 2; return v; };
+    const u32 = () => { const v = dv.getUint32(o, true); o += 4; return v; };
+
+    const version  = u8();
+    if (version < 1 || version > 4) throw new Error('Unsupported RTP version ' + version);
+    const nScenes  = u8();
+    /* sceneBlock */ u8();
+    const selScene = u8();
+
+    const scenes = [];
+    for (let i = 0; i < nScenes; i++) {
+        const nameLen = u8();
+        let name = '';
+        for (let k = 0; k < nameLen; k++) name += String.fromCharCode(u8());
+        const selSeq = version >= 2 ? u8() : 0;
+        const nSeq   = u8();
+        const seqs = [];
+        for (let j = 0; j < nSeq; j++) {
+            const t = u8(), c = u8(), col = u8(), len = u8(), inp = u8(), port = u8();
+            const nNotes = u16();
+            const en  = version >= 2 ? u8() : 1;
+            const div = version >= 3 ? u8() : 6;
+            let nm = '';
+            if (version >= 4) {
+                const nmLen = u8();
+                for (let k = 0; k < nmLen; k++) nm += String.fromCharCode(u8());
+            }
+            const notes = [];
+            for (let k = 0; k < nNotes; k++) {
+                const low = u32(), high = u32();
+                notes.push({
+                    n:   low & 0xFF,
+                    r:   (low >>> 8)  & 0xFF,
+                    v:   (low >>> 16) & 0xFF,
+                    l:   (low >>> 24) & 0xF,
+                    ttl: (low >>> 28) & 0xF,
+                    on:  ((high >>> 16) & 1) !== 0,
+                    lit: ((high >>> 17) & 1) !== 0
+                });
+            }
+            seqs.push({ t, c, col, l: len, i: inp, p: port, e: en, d: div, nm, s: notes });
+        }
+        scenes.push({ n: name, sel: selSeq, q: seqs });
+    }
+    return { sel: selScene, sc: scenes };
+}
+
+function serializeRtpseq(data) {
+    const enc = new TextEncoder();
+    // Write v4 only when a sequence actually carries a name, so files stay
+    // loadable by firmware that only understands up to v3.
+    const hasNames = data.sc.some(sc => sc.q.some(q => q.nm));
+    const version = hasNames ? 4 : 3;
+
+    let size = 8;
+    for (const scene of data.sc) {
+        size += 1 + enc.encode(scene.n || '').length + 2;
+        for (const seq of scene.q) {
+            size += 10 + seq.s.length * 8;
+            if (version >= 4) size += 1 + enc.encode(seq.nm || '').length;
+        }
+    }
+    const buf = new ArrayBuffer(size);
+    const dv  = new DataView(buf);
+    let o = 0;
+    const u8  = v => { dv.setUint8(o, v & 0xFF); o += 1; };
+    const u16 = v => { dv.setUint16(o, v & 0xFFFF, true); o += 2; };
+    const u32 = v => { dv.setUint32(o, v >>> 0, true); o += 4; };
+
+    u8(0x52); u8(0x54); u8(0x50); u8(0x30);          // 'RTP0'
+    u8(version); u8(data.sc.length); u8(SCENE_BLOCK); u8(data.sel || 0);
+
+    for (const scene of data.sc) {
+        const nb = enc.encode(scene.n || '');
+        u8(nb.length);
+        for (const b of nb) u8(b);
+        u8(scene.sel || 0);
+        u8(scene.q.length);
+        for (const seq of scene.q) {
+            u8(seq.t); u8(seq.c); u8(seq.col || 0); u8(seq.l);
+            u8(seq.i || 0); u8(seq.p || 0);
+            u16(seq.s.length);
+            u8(seq.e ? 1 : 0);
+            u8(seq.d === undefined ? 6 : seq.d);
+            if (version >= 4) {
+                const snb = enc.encode(seq.nm || '');
+                u8(snb.length);
+                for (const b of snb) u8(b);
+            }
+            for (const note of seq.s) {
+                const low = (note.n & 0xFF) | ((note.r & 0xFF) << 8) |
+                            ((note.v & 0xFF) << 16) | ((note.l & 0xF) << 24) |
+                            (((note.ttl === undefined ? note.l : note.ttl) & 0xF) << 28);
+                // per-note ch/port/hostIdx are overwritten at playback; use defaults
+                const high = (0xFF << 8) | ((note.on ? 1 : 0) << 16) |
+                             ((note.lit ? 1 : 0) << 17);
+                u32(low); u32(high);
+            }
+        }
+    }
+    return buf;
+}
+
+// ============================================================================
+// Legacy JSON import / export (firmware-compatible key names)
+// ============================================================================
+function normalizeJson(data) {
+    const scenes = (data.sc || data.scenes || []).map(scene => ({
+        n:   scene.n || '',
+        sel: scene.sel || 0,
+        q:   (scene.q || []).map(seq => {
+            const t = seq.t !== undefined ? seq.t : (seq.type || 0);
+            const rawNotes = seq.s || seq.seq || [];
+            const notes = rawNotes.map(note => {
+                const v = note.v !== undefined ? note.v : (note.vel || 0);
+                const r = note.r !== undefined ? note.r : (note.read || 0);
+                const l = note.l !== undefined ? note.l : (note.len || 1);
+                return { n: t === 0 ? r : 0, r, v, l, ttl: l, on: v > 0, lit: false };
+            });
+            return {
+                t,
+                c:   seq.c !== undefined ? seq.c : (seq.ch || 1),
+                col: seq.col || 0,
+                l:   seq.l || Math.max(1, Math.ceil(notes.length / SEQ_BLOCK)),
+                i:   seq.i || 0,
+                p:   seq.p || 0,
+                e:   seq.e === undefined ? 1 : seq.e,
+                d:   seq.d === undefined ? 6 : seq.d,
+                nm:  seq.n || '',
+                s:   notes
+            };
+        })
+    }));
+    return { sel: data.sel || 0, sc: scenes };
+}
+
+function toFirmwareJson(data) {
+    return {
+        sel: data.sel || 0,
+        sc: data.sc.map(scene => ({
+            n: scene.n, sel: scene.sel || 0,
+            q: scene.q.map(seq => ({
+                t: seq.t, c: seq.c, p: seq.p || 0, i: seq.i || 0,
+                l: seq.l, d: seq.d === undefined ? 6 : seq.d,
+                e: seq.e ? 1 : 0, n: seq.nm || '',
+                s: seq.s.map(note => ({
+                    r: seq.t === 0 ? note.n : note.r,
+                    v: note.on ? note.v : 0,
+                    l: note.l
+                }))
+            }))
+        }))
+    };
+}
+
+// ============================================================================
+// File loading
+// ============================================================================
+function loadFile(file) {
     if (!file) return;
-    
     const reader = new FileReader();
-    reader.onload = function(e) {
+    reader.onload = e => {
         try {
-            const data = JSON.parse(e.target.result);
+            const buf = e.target.result;
+            const head = new Uint8Array(buf, 0, Math.min(4, buf.byteLength));
+            let data;
+            if (head[0] === 0x52 && head[1] === 0x54 && head[2] === 0x50 && head[3] === 0x30) {
+                data = parseRtpseq(buf);
+            } else {
+                data = normalizeJson(JSON.parse(new TextDecoder().decode(buf)));
+            }
+            currentFileName = file.name;
             loadSequencerData(data);
-        } catch (error) {
-            alert('Error parsing JSON file: ' + error.message);
+            setStatus(`Loaded ${file.name} — ${data.sc.length} scene(s)`);
+        } catch (err) {
+            setStatus('Error: ' + err.message, true);
         }
     };
-    reader.readAsText(file);
+    reader.readAsArrayBuffer(file);
 }
 
-// Load sequencer data and update UI
 function loadSequencerData(data) {
     sequencerData = data;
     saveFileBtn.disabled = false;
-    
-    // Render scenes list
+    exportJsonBtn.disabled = false;
+    fileNameLabel.textContent = currentFileName || 'untitled';
     renderScenesList();
-    
-    // Select first scene by default
-    if (sequencerData.sc && sequencerData.sc.length > 0) {
-        selectScene(0);
+    if (sequencerData.sc.length > 0) {
+        selectScene(Math.min(sequencerData.sel || 0, sequencerData.sc.length - 1));
     }
 }
 
-// Render the list of scenes
+function setStatus(msg, isError) {
+    statusBar.textContent = msg;
+    statusBar.classList.toggle('error', !!isError);
+}
+
+// ============================================================================
+// Rendering — scenes
+// ============================================================================
 function renderScenesList() {
     scenesList.innerHTML = '';
-    
-    if (!sequencerData || !sequencerData.sc) return;
-    
+    if (!sequencerData) return;
     sequencerData.sc.forEach((scene, index) => {
-        const sceneItem = document.createElement('li');
-        sceneItem.className = 'scene-item';
-        sceneItem.textContent = `Scene ${index + 1}`;
-        sceneItem.dataset.index = index;
-        
-        if (index === currentSceneIndex) {
-            sceneItem.classList.add('active');
-        }
-        
-        sceneItem.addEventListener('click', () => selectScene(index));
-        scenesList.appendChild(sceneItem);
+        const li = document.createElement('li');
+        li.className = 'scene-item';
+        li.dataset.index = index;
+        li.textContent = scene.n || `Scene ${index + 1}`;
+        li.title = 'Double-click to rename';
+        if (index === currentSceneIndex) li.classList.add('active');
+        li.addEventListener('click', () => selectScene(index));
+        li.addEventListener('dblclick', () => renameScene(li, scene));
+        scenesList.appendChild(li);
     });
 }
 
-// Select a scene and display its sequences
+function renameScene(li, scene) {
+    const input = document.createElement('input');
+    input.className = 'scene-rename';
+    input.value = scene.n || '';
+    input.maxLength = 32;
+    li.textContent = '';
+    li.appendChild(input);
+    input.focus();
+    input.select();
+    const commit = () => {
+        scene.n = input.value.trim();
+        renderScenesList();
+    };
+    input.addEventListener('blur', commit);
+    input.addEventListener('keydown', e => {
+        if (e.key === 'Enter') input.blur();
+        if (e.key === 'Escape') { input.value = scene.n || ''; input.blur(); }
+    });
+}
+
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"]/g, c =>
+        ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
 function selectScene(index) {
     currentSceneIndex = index;
     currentSequenceIndex = -1;
-    
-    // Update UI
+    selectedNoteIndex = -1;
+    if (sequencerData) sequencerData.sel = index;
+    const scene = sequencerData.sc[index];
     currentSceneIndexSpan.textContent = index + 1;
-    
-    // Update active scene in list
+    currentSceneNameSpan.textContent = scene.n ? `— ${scene.n}` : '';
     document.querySelectorAll('.scene-item').forEach(item => {
         item.classList.toggle('active', parseInt(item.dataset.index) === index);
     });
-    
-    // Render sequences for this scene
     renderSequences();
-    
-    // Clear sequence editor
     clearSequenceEditor();
 }
 
-// Render sequences for the current scene
+// ============================================================================
+// Rendering — sequence cards (4×4 trellis layout, row 0 at bottom)
+// ============================================================================
 function renderSequences() {
     sequencesContainer.innerHTML = '';
-    
-    if (currentSceneIndex === -1 || !sequencerData || !sequencerData.sc[currentSceneIndex]) return;
-    
+    if (currentSceneIndex === -1 || !sequencerData) return;
     const scene = sequencerData.sc[currentSceneIndex];
-    
     if (!scene.q || scene.q.length === 0) {
-        sequencesContainer.innerHTML = '<p>No sequences in this scene</p>';
+        sequencesContainer.innerHTML = '<p class="empty-hint">No sequences in this scene</p>';
         return;
     }
-    
-    // Classic matrix layout: group in rows of 4, bottom-to-top
-    const sequences = [...scene.q];
-    const rows = [];
+
     const numCols = 4;
-    const numRows = Math.ceil(sequences.length / numCols);
-    for (let i = 0; i < numRows; i++) {
-        rows.push(sequences.slice(i * numCols, (i + 1) * numCols));
-    }
-    rows.reverse(); // So first row (sequences 1-4) is at the bottom, last row at the top
-    
-    // Render each row
+    const numRows = Math.ceil(scene.q.length / numCols);
+    const rows = [];
+    for (let i = 0; i < numRows; i++) rows.push(scene.q.slice(i * numCols, (i + 1) * numCols));
+    rows.reverse();
+
     rows.forEach((row, rowIdx) => {
         const rowDiv = document.createElement('div');
         rowDiv.className = 'sequence-row';
         sequencesContainer.appendChild(rowDiv);
-        
-        // Render each sequence in the row
+
         row.forEach((sequence, colIdx) => {
-            // Compute the actual index in the original scene.q array
-            // Since rows are reversed, we need to map back:
-            const actualRow = numRows - 1 - rowIdx;
-            const index = actualRow * numCols + colIdx;
-            const sequenceCard = document.createElement('div');
-            sequenceCard.className = 'sequence-card';
-            sequenceCard.setAttribute('data-index', index);
-            if (index === currentSequenceIndex) {
-                sequenceCard.classList.add('selected');
-            }
-            
-            const sequenceTitle = document.createElement('h3');
-            
-            // Add color indicator for sequence type
-            const typeIndicator = document.createElement('span');
-            typeIndicator.className = `type-indicator sequence-type-${sequence.t}`;
-            sequenceTitle.appendChild(typeIndicator);
-            
-            // Add sequence number
-            const titleText = document.createTextNode(`Sequence ${index + 1}`);
-            sequenceTitle.appendChild(titleText);
-            
-            const sequenceInfo = document.createElement('div');
-            sequenceInfo.className = 'sequence-info';
-            
-            // Get type name based on sequence type
-            let typeName = 'Unknown';
-            switch(sequence.t) {
-                case 0: typeName = 'DRUM'; break;
-                case 1: typeName = 'BASS SYNTH'; break;
-                case 2: typeName = 'MONO SYNTH'; break;
-                case 3: typeName = 'POLY SYNTH'; break;
-                case 4: typeName = 'CONTROL TRACK'; break;
-                case 5: typeName = 'HARMONY TRACK'; break;
-            }
-            
-            // Create type div
-            const typeDiv = document.createElement('div');
-            typeDiv.className = 'sequence-type';
-            typeDiv.textContent = typeName;
-            sequenceInfo.appendChild(typeDiv);
-            
-            // Create channel div
-            const channelDiv = document.createElement('div');
-            channelDiv.className = 'sequence-channel';
-            channelDiv.textContent = `CH${sequence.c}`;
-            sequenceInfo.appendChild(channelDiv);
-            
-            const sequencePreview = document.createElement('div');
-            sequencePreview.className = 'sequence-preview';
-            
-            // Create a mini visualization of the sequence
-            createMiniSequencePreview(sequencePreview, sequence);
-            
-            sequenceCard.appendChild(sequenceTitle);
-            sequenceCard.appendChild(sequenceInfo);
-            sequenceCard.appendChild(sequencePreview);
-            
-            sequenceCard.addEventListener('click', () => {
-                selectSequence(index);
-            });
-            
-            rowDiv.appendChild(sequenceCard);
+            const index = (numRows - 1 - rowIdx) * numCols + colIdx;
+            const card = document.createElement('div');
+            card.className = 'sequence-card';
+            card.dataset.index = index;
+            if (!sequence.e) card.classList.add('muted');
+            if (index === currentSequenceIndex) card.classList.add('selected');
+            card.style.setProperty('--seq-color', colorForIndex(sequence.col || 0));
+
+            const head = document.createElement('div');
+            head.className = 'card-head';
+            head.innerHTML =
+                `<span class="type-dot"></span>` +
+                `<span class="card-title">${escapeHtml(sequence.nm || 'Seq ' + (index + 1))}</span>` +
+                `<span class="card-type">${TYPE_NAMES[sequence.t] || '?'}</span>`;
+            card.appendChild(head);
+
+            const meta = document.createElement('div');
+            meta.className = 'card-meta';
+            meta.innerHTML =
+                `<span>CH ${sequence.c}</span>` +
+                `<span>${PORT_NAMES[sequence.p] || 'Port ' + sequence.p}</span>` +
+                `<span>${CLOCK_DIVIDER_LABELS[sequence.d] || '1/16'}</span>` +
+                `<span>${sequence.l}p</span>`;
+            card.appendChild(meta);
+
+            const preview = document.createElement('div');
+            preview.className = 'sequence-preview';
+            createMiniSequencePreview(preview, sequence);
+            card.appendChild(preview);
+
+            card.addEventListener('click', () => selectSequence(index));
+            rowDiv.appendChild(card);
         });
     });
 }
 
-// Select a sequence and display it in the editor
+function createMiniSequencePreview(container, sequence) {
+    container.innerHTML = '';
+    if (!sequence || !sequence.s) return;
+    const grid = document.createElement('div');
+    grid.className = 'mini-grid';
+    container.appendChild(grid);
+    const color = colorForIndex(sequence.col || 0);
+    const total = sequence.s.length;
+    const bars = Math.ceil(total / SEQ_BLOCK);
+    for (let bar = 0; bar < bars; bar++) {
+        const barDiv = document.createElement('div');
+        barDiv.className = 'mini-bar';
+        for (let step = 0; step < SEQ_BLOCK; step++) {
+            const idx = bar * SEQ_BLOCK + step;
+            if (idx >= total) break;
+            const cell = document.createElement('div');
+            cell.className = 'mini-cell';
+            if (sequence.s[idx].on) {
+                cell.classList.add('active');
+                cell.style.backgroundColor = color;
+                cell.style.opacity = 0.35 + 0.65 * (sequence.s[idx].v / 127);
+            }
+            barDiv.appendChild(cell);
+        }
+        grid.appendChild(barDiv);
+    }
+}
+
+// ============================================================================
+// Add / remove scenes & sequences
+// ============================================================================
+function makeEmptyNote() {
+    return { n: 0, r: 0, v: 0, l: 1, ttl: 1, on: false, lit: false };
+}
+
+function makeDefaultSequence() {
+    return {
+        t: 2, c: 1, col: 8, l: 1, i: 0, p: 0, e: 1, d: 6, nm: '',
+        s: Array.from({ length: SEQ_BLOCK }, makeEmptyNote)
+    };
+}
+
+function addScene() {
+    if (!sequencerData) return;
+    const seqs = [];
+    for (let i = 0; i < SCENE_BLOCK; i++) seqs.push(makeDefaultSequence());
+    sequencerData.sc.push({ n: '', sel: 0, q: seqs });
+    renderScenesList();
+    selectScene(sequencerData.sc.length - 1);
+    setStatus(`Scene added — ${sequencerData.sc.length} scenes`);
+}
+
+function removeScene() {
+    if (!sequencerData || sequencerData.sc.length <= 1) {
+        setStatus('Cannot remove the last scene', true);
+        return;
+    }
+    sequencerData.sc.splice(currentSceneIndex, 1);
+    if (sequencerData.sel >= sequencerData.sc.length)
+        sequencerData.sel = sequencerData.sc.length - 1;
+    const next = Math.min(currentSceneIndex, sequencerData.sc.length - 1);
+    renderScenesList();
+    selectScene(next);
+    setStatus(`Scene removed — ${sequencerData.sc.length} scenes`);
+}
+
+function addSequence() {
+    const scene = sequencerData && sequencerData.sc[currentSceneIndex];
+    if (!scene) return;
+    if (scene.q.length >= SCENE_BLOCK) {
+        setStatus('Scene already has 16 sequences', true);
+        return;
+    }
+    scene.q.push(makeDefaultSequence());
+    renderSequences();
+    selectSequence(scene.q.length - 1);
+}
+
+function removeSequence() {
+    const scene = sequencerData && sequencerData.sc[currentSceneIndex];
+    if (!scene || scene.q.length === 0) return;
+    const idx = currentSequenceIndex >= 0 ? currentSequenceIndex : scene.q.length - 1;
+    scene.q.splice(idx, 1);
+    if (scene.sel >= scene.q.length) scene.sel = Math.max(0, scene.q.length - 1);
+    currentSequenceIndex = -1;
+    selectedNoteIndex = -1;
+    renderSequences();
+    clearSequenceEditor();
+}
+
+// ============================================================================
+// Sequence editor
+// ============================================================================
 function selectSequence(index) {
     currentSequenceIndex = index;
-    
-    // Update active sequence in grid
+    selectedNoteIndex = -1;
     document.querySelectorAll('.sequence-card').forEach(card => {
-        card.classList.toggle('active', parseInt(card.dataset.index, 10) === index);
+        card.classList.toggle('selected', parseInt(card.dataset.index, 10) === index);
     });
-    
-    // Load sequence data into editor
     loadSequenceIntoEditor();
 }
 
-// Load the current sequence into the editor
-function loadSequenceIntoEditor() {
-    if (currentSceneIndex === -1 || currentSequenceIndex === -1) return;
-    
-    const sequence = sequencerData.sc[currentSceneIndex].q[currentSequenceIndex];
-    
-    // Set sequence properties
-    sequenceType.value = sequence.t;
-    sequenceChannel.value = sequence.c;
-    
-    // Update the editor title with sequence type color
-    const editorTitle = document.querySelector('.sequence-editor h2');
-    editorTitle.innerHTML = '';
-    
-    // Add color indicator
-    const typeIndicator = document.createElement('span');
-    typeIndicator.className = `type-indicator sequence-type-${sequence.t}`;
-    editorTitle.appendChild(typeIndicator);
-    
-    // Add text
-    const titleText = document.createTextNode('Sequence Editor');
-    editorTitle.appendChild(titleText);
-    
-    // Render notes grid
-    renderNotesGrid(sequence);
-    
-    // Add event listeners for property changes
-    sequenceType.onchange = updateSequenceProperty;
-    sequenceChannel.onchange = updateSequenceProperty;
+function currentSequence() {
+    if (currentSceneIndex === -1 || currentSequenceIndex === -1) return null;
+    return sequencerData.sc[currentSceneIndex].q[currentSequenceIndex];
 }
 
-// Render the notes grid for the current sequence
+function loadSequenceIntoEditor() {
+    const seq = currentSequence();
+    if (!seq) return;
+
+    $('sequenceName').value    = seq.nm || '';
+    $('sequenceType').value    = seq.t;
+    $('sequenceChannel').value = seq.c;
+    $('sequencePort').value    = seq.p || 0;
+    $('sequenceInput').value   = seq.i || 0;
+    $('sequenceDivider').value = seq.d === undefined ? 6 : seq.d;
+    $('sequenceLength').value  = seq.l;
+    $('sequenceColor').value   = seq.col || 0;
+    $('sequenceEnabled').checked = !!seq.e;
+    updateColorSwatch();
+
+    const dot = $('editorTypeDot');
+    dot.style.backgroundColor = colorForIndex(seq.col || 0);
+
+    $('editorTitle').textContent =
+        `${seq.nm || 'Sequence ' + (currentSequenceIndex + 1)} — ${TYPE_NAMES[seq.t] || '?'}`;
+
+    renderNotesGrid(seq);
+    hideNoteInspector();
+}
+
+function updateColorSwatch() {
+    $('colorSwatch').style.backgroundColor = colorForIndex(parseInt($('sequenceColor').value));
+}
+
+function updateSequenceProperty() {
+    const seq = currentSequence();
+    if (!seq) return;
+    seq.t   = parseInt($('sequenceType').value);
+    seq.nm  = $('sequenceName').value.trim();
+    seq.c   = parseInt($('sequenceChannel').value);
+    seq.p   = parseInt($('sequencePort').value);
+    seq.i   = parseInt($('sequenceInput').value);
+    seq.d   = parseInt($('sequenceDivider').value);
+    seq.col = parseInt($('sequenceColor').value);
+    seq.e   = $('sequenceEnabled').checked ? 1 : 0;
+
+    const newLen = parseInt($('sequenceLength').value);
+    if (newLen !== seq.l) {
+        seq.l = newLen;
+        resizeSequence(seq, newLen * SEQ_BLOCK);
+    }
+
+    $('editorTypeDot').style.backgroundColor = colorForIndex(seq.col || 0);
+    $('editorTitle').textContent =
+        `${seq.nm || 'Sequence ' + (currentSequenceIndex + 1)} — ${TYPE_NAMES[seq.t] || '?'}`;
+    updateColorSwatch();
+    renderSequences();
+    renderNotesGrid(seq);
+}
+
+function resizeSequence(seq, newSize) {
+    while (seq.s.length < newSize) {
+        seq.s.push({ n: 0, r: 0, v: 0, l: 1, ttl: 1, on: false, lit: false });
+    }
+    seq.s.length = newSize;
+}
+
+// ============================================================================
+// Notes grid
+// ============================================================================
 function renderNotesGrid(sequence) {
     notesGrid.innerHTML = '';
-    
     if (!sequence || !sequence.s) return;
-    
-    // Add sequence type class to the notes grid for styling active notes
-    notesGrid.className = `notes-grid sequence-type-${sequence.t}`;
-    
-    // Calculate how many bars we need (assuming 16 steps per bar)
-    const totalNotes = sequence.s.length;
-    const barsCount = Math.ceil(totalNotes / 16);
-    
-    // Render bars in reverse order (from bottom to top)
-    for (let bar = barsCount - 1; bar >= 0; bar--) {
-        // Add a bar separator if this isn't the last bar (first in reversed order)
-        if (bar < barsCount - 1) {
-            const barSeparator = document.createElement('div');
-            barSeparator.className = 'bar-separator';
-            notesGrid.appendChild(barSeparator);
+    const color = colorForIndex(sequence.col || 0);
+    const total = sequence.s.length;
+    const bars = Math.ceil(total / SEQ_BLOCK);
+
+    for (let bar = 0; bar < bars; bar++) {
+        const row = document.createElement('div');
+        row.className = 'notes-row';
+
+        const label = document.createElement('span');
+        label.className = 'bar-label';
+        label.textContent = bar + 1;
+        row.appendChild(label);
+
+        for (let i = 0; i < SEQ_BLOCK; i++) {
+            const idx = bar * SEQ_BLOCK + i;
+            if (idx >= total) break;
+            const note = sequence.s[idx];
+            const cell = document.createElement('div');
+            cell.className = 'note-cell';
+            cell.dataset.index = idx;
+            if (i % 4 === 0) cell.classList.add('beat-start');
+            paintNoteCell(cell, note, color, sequence.t);
+
+            cell.addEventListener('click', () => onNoteClick(idx));
+            cell.addEventListener('dblclick', () => toggleNote(idx));
+            cell.addEventListener('wheel', e => onNoteWheel(e, idx), { passive: false });
+            row.appendChild(cell);
         }
-        
-        // Create a row for this bar
-        const barRow = document.createElement('div');
-        barRow.className = 'notes-row';
-        notesGrid.appendChild(barRow);
-        
-        // Add the notes for this bar
-        for (let i = 0; i < 16; i++) {
-            const noteIndex = bar * 16 + i;
-            
-            // Skip if we've reached the end of the sequence
-            if (noteIndex >= totalNotes) continue;
-            
-            const note = sequence.s[noteIndex];
-            const noteCell = document.createElement('div');
-            noteCell.className = 'note-cell';
-            noteCell.dataset.index = noteIndex;
-            
-            // Add beat number indicator for first note in each group of 4
-            if (i % 4 === 0) {
-                noteCell.dataset.beat = (i / 4) + 1;
-            }
-            
-            if (note.v > 0) {
-                noteCell.classList.add('active');
-                noteCell.classList.add(`active-type-${sequence.t}`);
-                
-                // Set brightness based on velocity (0-127)
-                const brightness = 50 + (note.v / 127 * 50);
-                noteCell.style.filter = `brightness(${brightness}%)`;
-            }
-            
-            // Add velocity and length indicators
-            const velocitySpan = document.createElement('span');
-            velocitySpan.className = 'velocity';
-            velocitySpan.textContent = note.v;
-            
-            const lengthSpan = document.createElement('span');
-            lengthSpan.className = 'length';
-            if (note.l) {
-                lengthSpan.textContent = note.l;
-            }
-            
-            noteCell.appendChild(velocitySpan);
-            noteCell.appendChild(lengthSpan);
-            
-            // Add click event to toggle note
-            noteCell.addEventListener('click', () => toggleNote(noteIndex));
-            
-            // Add wheel event to change velocity
-            noteCell.addEventListener('wheel', (event) => {
-                event.preventDefault();
-                if (currentSceneIndex === -1 || currentSequenceIndex === -1) return;
-                
-                const sequence = sequencerData.sc[currentSceneIndex].q[currentSequenceIndex];
-                if (!sequence || !sequence.s || noteIndex >= sequence.s.length) return;
-                
-                // Only adjust velocity if note is active
-                if (sequence.s[noteIndex].v > 0) {
-                    // Adjust velocity based on wheel direction (up = increase, down = decrease)
-                    const delta = event.deltaY < 0 ? 5 : -5;
-                    sequence.s[noteIndex].v = Math.max(1, Math.min(127, sequence.s[noteIndex].v + delta));
-                    
-                    // Update note cell appearance
-                    updateNoteCell(noteIndex, sequence);
-                    
-                    // Update the mini preview
-                    updateMiniPreview(sequence);
-                }
-            });
-            
-            barRow.appendChild(noteCell);
-        }
+        notesGrid.appendChild(row);
     }
 }
 
-// Toggle note state
-function toggleNote(index) {
-    if (currentSceneIndex === -1 || currentSequenceIndex === -1) return;
-    
-    const sequence = sequencerData.sc[currentSceneIndex].q[currentSequenceIndex];
-    if (!sequence || !sequence.s || index >= sequence.s.length) return;
-    
-    // Toggle velocity (0 = off, 127 = on)
-    sequence.s[index].v = sequence.s[index].v > 0 ? 0 : 127;
-    
-    // Update note cell appearance
-    updateNoteCell(index, sequence);
-    
-    // Update the mini preview
-    updateMiniPreview(sequence);
+// Label shown inside an active cell, per sequence type.
+// Harmony tracks store root (r, 0-11) + chord type (v, 0-15) instead of
+// pitch/velocity, so they get chord labels like "Am7".
+function cellLabel(seqType, note) {
+    if (seqType === TYPE_HARMONY) {
+        const root  = NOTE_NAMES[note.r % 12];
+        const chord = CHORD_NAMES[note.v & 0xF];
+        return chord === 'note' ? root : root + chord;
+    }
+    if (seqType === 0) return note.n ? noteName(note.n) : '';   // drum: pitch
+    return note.n ? noteName(note.n) : (note.r || '');
 }
 
-// Update note cell appearance
-function updateNoteCell(index, sequence) {
-    // Find the note cell in the grid and update its classes
-    const noteCell = document.querySelector(`.note-cell[data-index="${index}"]`);
-    if (!noteCell) return;
-    
-    if (sequence.s[index].v > 0) {
-        noteCell.classList.add('active');
-        noteCell.classList.add(`active-type-${sequence.t}`);
-        
-        // Set brightness based on velocity (0-127)
-        const brightness = 50 + (sequence.s[index].v / 127 * 50);
-        noteCell.style.filter = `brightness(${brightness}%)`;
+function paintNoteCell(cell, note, color, seqType) {
+    cell.classList.toggle('active', note.on);
+    cell.classList.toggle('selected', parseInt(cell.dataset.index) === selectedNoteIndex);
+    if (note.on) {
+        cell.style.backgroundColor = color;
+        cell.style.opacity = 0.3 + 0.7 * (note.v / 127);
     } else {
-        noteCell.classList.remove('active');
-        noteCell.classList.remove(`active-type-${sequence.t}`);
-        noteCell.style.filter = '';
+        cell.style.backgroundColor = '';
+        cell.style.opacity = '';
     }
-    
-    // Update velocity display
-    const velocitySpan = noteCell.querySelector('.velocity');
-    if (velocitySpan) {
-        velocitySpan.textContent = sequence.s[index].v;
-    }
+    const isHarmony = seqType === TYPE_HARMONY;
+    cell.innerHTML =
+        `<span class="cell-note">${note.on ? cellLabel(seqType, note) : ''}</span>` +
+        `<span class="cell-vel">${note.on && !isHarmony ? note.v : ''}</span>` +
+        `<span class="cell-len">${note.on && note.l > 1 ? note.l : ''}</span>`;
 }
 
-// Update the mini preview
+function onNoteClick(idx) {
+    selectedNoteIndex = idx;
+    const seq = currentSequence();
+    document.querySelectorAll('.note-cell').forEach(c =>
+        c.classList.toggle('selected', parseInt(c.dataset.index) === idx));
+    showNoteInspector(seq, idx);
+}
+
+function toggleNote(idx) {
+    const seq = currentSequence();
+    if (!seq || idx >= seq.s.length) return;
+    const note = seq.s[idx];
+    note.on = !note.on;
+    if (note.on && note.v === 0) note.v = 100;
+    refreshNote(idx);
+}
+
+function onNoteWheel(e, idx) {
+    e.preventDefault();
+    const seq = currentSequence();
+    if (!seq || idx >= seq.s.length) return;
+    const note = seq.s[idx];
+    if (!note.on) return;
+    const delta = e.deltaY < 0 ? 1 : -1;
+    if (e.shiftKey) {
+        note.l = Math.max(1, Math.min(15, note.l + delta));
+        note.ttl = note.l;
+    } else if (seq.t === TYPE_HARMONY) {
+        // wheel cycles chord types on harmony tracks
+        note.v = Math.max(0, Math.min(15, note.v + delta));
+    } else {
+        note.v = Math.max(1, Math.min(127, note.v + delta * 5));
+    }
+    refreshNote(idx);
+    if (selectedNoteIndex === idx) showNoteInspector(seq, idx);
+}
+
+function refreshNote(idx) {
+    const seq = currentSequence();
+    const cell = notesGrid.querySelector(`.note-cell[data-index="${idx}"]`);
+    if (cell && seq) paintNoteCell(cell, seq.s[idx], colorForIndex(seq.col || 0), seq.t);
+    updateMiniPreview(seq);
+}
+
 function updateMiniPreview(sequence) {
-    const sequenceCard = document.querySelector(`.sequence-card[data-index="${currentSequenceIndex}"]`);
-    if (sequenceCard) {
-        const previewContainer = sequenceCard.querySelector('.sequence-preview');
-        if (previewContainer) {
-            createMiniSequencePreview(previewContainer, sequence);
-        }
+    const card = sequencesContainer.querySelector(
+        `.sequence-card[data-index="${currentSequenceIndex}"]`);
+    if (card) {
+        const preview = card.querySelector('.sequence-preview');
+        if (preview) createMiniSequencePreview(preview, sequence);
     }
 }
 
-// Update sequence property (type or channel)
-function updateSequenceProperty() {
-    if (currentSceneIndex === -1 || currentSequenceIndex === -1) return;
-    
-    const sequence = sequencerData.sc[currentSceneIndex].q[currentSequenceIndex];
-    
-    sequence.t = parseInt(sequenceType.value);
-    sequence.c = parseInt(sequenceChannel.value);
-    
-    // Update the editor title with sequence type color
-    const editorTitle = document.querySelector('.sequence-editor h2');
-    editorTitle.innerHTML = '';
-    
-    // Add color indicator
-    const typeIndicator = document.createElement('span');
-    typeIndicator.className = `type-indicator sequence-type-${sequence.t}`;
-    editorTitle.appendChild(typeIndicator);
-    
-    // Add text
-    const titleText = document.createTextNode('Sequence Editor');
-    editorTitle.appendChild(titleText);
-    
-    // Update sequence card info
-    renderSequences();
-}
+// ============================================================================
+// Note inspector
+// ============================================================================
+function showNoteInspector(seq, idx) {
+    const note = seq.s[idx];
+    const isHarmony = seq.t === TYPE_HARMONY;
+    noteInspector.hidden = false;
+    $('niStep').textContent = idx + 1;
+    $('niOn').checked = note.on;
+    $('niLen').value = note.l;
 
-// Create a mini sequence preview
-function createMiniSequencePreview(container, sequence) {
-    container.innerHTML = '';
-    
-    if (!sequence || !sequence.s) return;
-    
-    const previewGrid = document.createElement('div');
-    previewGrid.className = `mini-grid sequence-type-${sequence.t}`;
-    container.appendChild(previewGrid);
-    
-    // Calculate bars
-    const totalNotes = sequence.s.length;
-    const barsCount = Math.ceil(totalNotes / 16);
-    
-    // Process bars in reverse order (bottom to top)
-    for (let bar = barsCount - 1; bar >= 0; bar--) {
-        const barContainer = document.createElement('div');
-        barContainer.className = 'mini-bar';
-        
-        // Process notes in this bar
-        for (let step = 0; step < 16; step++) {
-            const noteIndex = bar * 16 + step;
-            
-            // Skip if we've reached the end of the sequence
-            if (noteIndex >= totalNotes) continue;
-            
-            const note = sequence.s[noteIndex];
-            const noteCell = document.createElement('div');
-            noteCell.className = 'mini-cell';
-            
-            if (note.v > 0) {
-                noteCell.classList.add('active');
-                noteCell.classList.add(`active-type-${sequence.t}`);
-            }
-            
-            barContainer.appendChild(noteCell);
-        }
-        
-        previewGrid.appendChild(barContainer);
+    // Harmony steps are (root, chord type); everything else is pitch/vel/etc.
+    $('niStandardFields').hidden = isHarmony;
+    $('niHarmonyFields').hidden = !isHarmony;
+    if (isHarmony) {
+        $('niRoot').value = note.r % 12;
+        $('niChord').value = note.v & 0xF;
+    } else {
+        $('niNote').value = note.n;
+        $('niNoteName').textContent = noteName(note.n);
+        $('niRead').value = note.r;
+        $('niVel').value = note.v;
+        $('niVelRange').value = note.v;
+        $('niLit').checked = note.lit;
     }
 }
 
-// Clear the sequence editor
+function hideNoteInspector() {
+    noteInspector.hidden = true;
+    selectedNoteIndex = -1;
+}
+
+function applyNoteInspector() {
+    const seq = currentSequence();
+    if (!seq || selectedNoteIndex < 0) return;
+    const note = seq.s[selectedNoteIndex];
+    note.on  = $('niOn').checked;
+    note.l   = Math.max(1, Math.min(15, parseInt($('niLen').value) || 1));
+    note.ttl = note.l;
+    if (seq.t === TYPE_HARMONY) {
+        note.r = parseInt($('niRoot').value);
+        note.v = parseInt($('niChord').value);
+    } else {
+        note.n   = Math.max(0, Math.min(127, parseInt($('niNote').value) || 0));
+        note.r   = Math.max(0, Math.min(127, parseInt($('niRead').value) || 0));
+        note.v   = Math.max(0, Math.min(127, parseInt($('niVel').value) || 0));
+        note.lit = $('niLit').checked;
+        $('niNoteName').textContent = noteName(note.n);
+    }
+    refreshNote(selectedNoteIndex);
+}
+
+// ============================================================================
+// Editor helpers
+// ============================================================================
 function clearSequenceEditor() {
-    sequenceType.value = '';
-    sequenceChannel.value = '';
     notesGrid.innerHTML = '';
+    $('editorTitle').textContent = 'Select a sequence';
+    $('editorTypeDot').style.backgroundColor = 'transparent';
+    hideNoteInspector();
 }
 
-// Save changes to a file
-function saveChanges() {
-    if (!sequencerData) return;
-    
-    const jsonString = JSON.stringify(sequencerData, null, 2);
-    const blob = new Blob([jsonString], { type: 'application/json' });
+// ============================================================================
+// Save / export
+// ============================================================================
+function download(blob, name) {
     const url = URL.createObjectURL(blob);
-    
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'scenes.json';
+    a.download = name;
     a.click();
-    
     URL.revokeObjectURL(url);
 }
 
-// Initialize the application when the page loads
+function saveChanges() {
+    if (!sequencerData) return;
+    const buf = serializeRtpseq(sequencerData);
+    const name = (currentFileName || 'pattern.rtpseq')
+        .replace(/\.(json|bin)$/i, '.rtpseq');
+    download(new Blob([buf], { type: 'application/octet-stream' }),
+             name.endsWith('.rtpseq') ? name : name + '.rtpseq');
+    setStatus(`Saved ${name} (${buf.byteLength} bytes)`);
+}
+
+function exportJson() {
+    if (!sequencerData) return;
+    const json = JSON.stringify(toFirmwareJson(sequencerData));
+    download(new Blob([json], { type: 'application/json' }), 'scenes.json');
+    setStatus('Exported scenes.json (legacy format — note pitch is not preserved)');
+}
+
+// ============================================================================
+// Init
+// ============================================================================
+function init() {
+    loadFileBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', e => loadFile(e.target.files[0]));
+    saveFileBtn.addEventListener('click', saveChanges);
+    exportJsonBtn.addEventListener('click', exportJson);
+
+    // Sequence property controls
+    for (const id of ['sequenceType', 'sequenceChannel', 'sequencePort',
+                      'sequenceInput', 'sequenceDivider', 'sequenceLength',
+                      'sequenceColor', 'sequenceEnabled']) {
+        $(id).addEventListener('change', updateSequenceProperty);
+    }
+    $('sequenceName').addEventListener('input', updateSequenceProperty);
+    $('sequenceColor').addEventListener('input', updateColorSwatch);
+
+    // Scene / sequence add-remove
+    $('addSceneBtn').addEventListener('click', addScene);
+    $('removeSceneBtn').addEventListener('click', removeScene);
+    $('addSeqBtn').addEventListener('click', addSequence);
+    $('removeSeqBtn').addEventListener('click', removeSequence);
+
+    // Note inspector controls
+    for (const id of ['niOn', 'niNote', 'niRead', 'niVel', 'niLen', 'niLit',
+                      'niRoot', 'niChord']) {
+        $(id).addEventListener('change', applyNoteInspector);
+    }
+    $('niVelRange').addEventListener('input', e => {
+        $('niVel').value = e.target.value;
+        applyNoteInspector();
+    });
+    $('niNote').addEventListener('input', e => {
+        $('niNoteName').textContent = noteName(parseInt(e.target.value) || 0);
+    });
+
+    // Drag & drop
+    let dragDepth = 0;
+    window.addEventListener('dragenter', e => {
+        e.preventDefault();
+        dragDepth++;
+        dropOverlay.hidden = false;
+    });
+    window.addEventListener('dragleave', e => {
+        e.preventDefault();
+        if (--dragDepth <= 0) { dragDepth = 0; dropOverlay.hidden = true; }
+    });
+    window.addEventListener('dragover', e => e.preventDefault());
+    window.addEventListener('drop', e => {
+        e.preventDefault();
+        dragDepth = 0;
+        dropOverlay.hidden = true;
+        if (e.dataTransfer.files.length) loadFile(e.dataTransfer.files[0]);
+    });
+
+    // Auto-load: try a pattern next to the app (works when served by a
+    // webserver, e.g. the ESP32), then fall back to the legacy JSON demo.
+    fetch('pattern.rtpseq')
+        .then(r => r.ok ? r.arrayBuffer() : Promise.reject())
+        .then(buf => {
+            currentFileName = 'pattern.rtpseq';
+            loadSequencerData(parseRtpseq(buf));
+            setStatus('Loaded pattern.rtpseq');
+        })
+        .catch(() => fetch('data/scenes.json')
+            .then(r => r.ok ? r.json() : Promise.reject())
+            .then(data => {
+                currentFileName = 'scenes.json';
+                loadSequencerData(normalizeJson(data));
+                setStatus('Loaded legacy scenes.json');
+            })
+            .catch(() => setStatus('Drop a .rtpseq or .json file to begin')));
+}
+
 window.addEventListener('DOMContentLoaded', init);
